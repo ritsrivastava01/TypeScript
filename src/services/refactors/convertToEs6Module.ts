@@ -17,31 +17,8 @@ namespace ts.refactor.installTypesForPackage {
             return undefined;
         }
 
-        //TODO: probably activate at more places.
         const node = getTokenAtPosition(file, startPosition, /*includeJsDocComment*/ false);
-        const { parent: call } = node;
-        if (!isIdentifier(node) || node.text !== "require" || !isCallExpression(call) || call.expression !== node) {
-            return undefined;
-        }
-        const { parent: varDecl } = call;
-        if (!isVariableDeclaration(varDecl)) {
-            return undefined;
-        }
-        const { parent: varDeclList } = varDecl;
-        if (varDeclList.kind !== SyntaxKind.VariableDeclarationList) {
-            return undefined;
-        }
-        const { parent: varStatement } = varDeclList;
-        if (varStatement.kind !== SyntaxKind.VariableStatement) {
-            return undefined;
-        }
-        const { parent: sourceFile } = varStatement;
-        if (!isSourceFile(sourceFile)) {
-            return undefined;
-        }
-        Debug.assert(sourceFile === file);
-
-        return [
+        return !isAtTriggerLocation(node) ? undefined : [
             {
                 name: convertToEs6Module.name,
                 description: convertToEs6Module.description,
@@ -53,6 +30,53 @@ namespace ts.refactor.installTypesForPackage {
                 ],
             },
         ];
+    }
+
+    //TODO: probably activate at more places.
+    function isAtTriggerLocation(node: Node) {
+        const { parent } = node;
+        switch (parent.kind) {
+            case SyntaxKind.CallExpression:
+                return isAtTopLevelRequire(parent as CallExpression);
+            case SyntaxKind.PropertyAccessExpression:
+                return isAtTopLevelExports(parent as PropertyAccessExpression);
+            default:
+                return false;
+        }
+    }
+
+    function isAtTopLevelRequire(call: CallExpression): boolean {
+        if (!isRequireCall(call, /*checkArgumentIsStringLiteral*/ true)) {
+            return false;
+        }
+        const { parent: varDecl } = call;
+        if (!isVariableDeclaration(varDecl)) {
+            return false;
+        }
+        const { parent: varDeclList } = varDecl;
+        if (varDeclList.kind !== SyntaxKind.VariableDeclarationList) {
+            return false;
+        }
+        const { parent: varStatement } = varDeclList;
+        return varStatement.kind === SyntaxKind.VariableStatement && varStatement.parent.kind === SyntaxKind.SourceFile;
+    }
+
+    function isAtTopLevelExports(prop: PropertyAccessExpression) {
+        if (!isIdentifier(prop.expression)) {
+            return false;
+        }
+        switch (prop.expression.text) {
+            case "module":
+            case "exports":
+                break;
+            default:
+                return false;
+        }
+        const { parent: bin } = prop;
+        if (!isBinaryExpression(bin) || bin.operatorToken.kind !== SyntaxKind.EqualsToken) {
+            return false;
+        }
+        return bin.parent.kind === SyntaxKind.ExpressionStatement && isSourceFile(bin.parent.parent);
     }
 
     function getEditsForAction(context: RefactorContext, _actionName: string): RefactorEditInfo | undefined {
@@ -71,7 +95,7 @@ namespace ts.refactor.installTypesForPackage {
                             changes.replaceNode(file, statement, makeImport(/*name*/ undefined, /*namedImports*/ undefined, statement.expression));
                         }
                         break;
-                    case SyntaxKind.VariableStatement:
+                    case SyntaxKind.VariableStatement: {
                         const { declarations } = (statement as VariableStatement).declarationList;
                         let didFindRequire = false;
                         const newNodes = flatMap(declarations, decl => {
@@ -89,10 +113,115 @@ namespace ts.refactor.installTypesForPackage {
                             changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
                         }
                         break;
+                    }
+                    case SyntaxKind.ExpressionStatement: {
+                        const { expression } = statement as ExpressionStatement;
+                        if (!isBinaryExpression(expression)) {
+                            break;
+                        }
+                        const { left, operatorToken, right } = expression;
+                        if (operatorToken.kind !== SyntaxKind.EqualsToken || !isPropertyAccessExpression(left) || !isIdentifier(left.expression)) {
+                            break;
+                        }
+                        switch (left.expression.text) {
+                            case "module":
+                                if (left.name.text === "exports") {
+                                    changes.replaceNode(file, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
+                                }
+                                break;
+                            case "exports": {
+                                // If "originalKeywordKind" was set, this is e.g. `exports.
+                                const { originalKeywordKind, text } = left.name;
+                                if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+                                    /*
+                                    const _class = 0;
+                                    export { _class as class };
+                                    */
+                                    const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
+                                    const newNodes = [
+                                        makeConst(/*modifiers*/ undefined, tmp, right),
+                                        createExportDeclaration(
+                                            /*decorators*/ undefined,
+                                            /*modifiers*/ undefined,
+                                            createNamedExports([createExportSpecifier(tmp, text)])),
+                                    ];
+                                    changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+                                }
+                                else {
+                                    changes.replaceNode(file, statement, doExportsDotXEquals(text, right), { useNonAdjustedEndPosition: true });
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
         return { edits, renameFilename: undefined, renameLocation: undefined }
+    }
+
+    function doModuleExports(exported: Expression): Statement {
+        const modifiers = [createToken(SyntaxKind.ExportKeyword), createToken(SyntaxKind.DefaultKeyword)];
+        switch (exported.kind) {
+            case SyntaxKind.FunctionExpression:
+            case SyntaxKind.ArrowFunction: {
+                // `module.exports = function f() {}` --> `export default function f() {}`
+                const fn = exported as FunctionExpression | ArrowFunction;
+                return makeFunctionDeclaration(fn.name && fn.name.text, modifiers, fn);
+            }
+            case SyntaxKind.ClassExpression: {
+                // `module.exports = class C {}` --> `export default class C {}`
+                const cls = exported as ClassExpression;
+                return makeClassDeclaration(cls.name && cls.name.text, modifiers, cls);
+            }
+            case SyntaxKind.CallExpression:
+                // `module.exports = require("x");` ==> `export * from "x";`
+                if (isRequireCall(exported, /*checkArguementIsStringLiteral*/ true)) {
+                    return createExportDeclaration(/*decorators*/ undefined, /*modifiers*/ undefined, /*exportClause*/ undefined, /*moduleSpecifier*/ createLiteral(exported.arguments[0]));
+                }
+                // falls through
+            default:
+                // `module.exports = 0;` --> `export default 0;`
+                return createExportAssignment(/*decorators*/ undefined, /*modifiers*/ undefined, /*isExportEquals*/ false, exported);
+        }
+    }
+
+    function doExportsDotXEquals(name: string | undefined, exported: Expression): Statement {
+        const modifiers = [createToken(SyntaxKind.ExportKeyword)];
+        switch (exported.kind) {
+            case SyntaxKind.FunctionExpression:
+            case SyntaxKind.ArrowFunction:
+                // `exports.f = function() {}` --> `export function f() {}`
+                return makeFunctionDeclaration(name, modifiers, exported as FunctionExpression | ArrowFunction);
+            case SyntaxKind.ClassExpression:
+                // `exports.C = class {}` --> `export class C {}`
+                return makeClassDeclaration(name, modifiers, exported as ClassExpression);
+            default:
+                // `exports.x = 0;` --> `export const x = 0;`
+                return makeConst(modifiers, createIdentifier(name), exported);
+        }
+    }
+
+    function makeFunctionDeclaration(name: string | undefined, additionalModifiers: ReadonlyArray<Modifier>, fn: FunctionExpression | ArrowFunction): FunctionDeclaration {
+        return createFunctionDeclaration(
+            getSynthesizedDeepClones(fn.decorators),
+            concatenate(additionalModifiers, getSynthesizedDeepClones(fn.modifiers)),
+            getSynthesizedDeepClone(fn.asteriskToken),
+            name,
+            getSynthesizedDeepClones(fn.typeParameters),
+            getSynthesizedDeepClones(fn.parameters),
+            getSynthesizedDeepClone(fn.type),
+            convertToFunctionBody(getSynthesizedDeepClone(fn.body)));
+    }
+
+    function makeClassDeclaration(name: string | undefined, additionalModifiers: ReadonlyArray<Modifier>, cls: ClassExpression): ClassDeclaration {
+        return createClassDeclaration(
+            getSynthesizedDeepClones(cls.decorators),
+            concatenate(additionalModifiers, getSynthesizedDeepClones(cls.modifiers)),
+            name,
+            getSynthesizedDeepClones(cls.typeParameters),
+            getSynthesizedDeepClones(cls.heritageClauses),
+            getSynthesizedDeepClones(cls.members));
     }
 
     /**
@@ -102,7 +231,7 @@ namespace ts.refactor.installTypesForPackage {
     function doSingleImport(
         file: SourceFile,
         vd: VariableDeclaration,
-        moduleSpecifier: StringLiteral,
+        moduleSpecifier: StringLiteralLike,
         changes: textChanges.ChangeTracker,
         checker: TypeChecker,
         identifiers: Identifiers,
@@ -126,10 +255,7 @@ namespace ts.refactor.installTypesForPackage {
                 const name = nameFromModuleSpecifier(moduleSpecifier, identifiers);
                 return [
                     makeImport(createIdentifier(name), /*namedImports*/ undefined, moduleSpecifier),
-                    createVariableStatement(/*modifiers*/ undefined,
-                        createVariableDeclarationList(
-                            [createVariableDeclaration(getSynthesizedDeepClone(vd.name), /*type*/ undefined, createIdentifier(name))],
-                            NodeFlags.Const)),
+                    makeConst(/*modifiers*/ undefined, getSynthesizedDeepClone(vd.name), createIdentifier(name)),
                 ];
             }
             case SyntaxKind.Identifier:
@@ -139,7 +265,14 @@ namespace ts.refactor.installTypesForPackage {
         }
     }
 
-    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: StringLiteral, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): Node[] {
+    //move
+    function makeConst(modifiers: ReadonlyArray<Modifier> | undefined, name: string | BindingName, init: Expression): VariableStatement {
+        return createVariableStatement(
+            modifiers,
+            createVariableDeclarationList([createVariableDeclaration(name, /*type*/ undefined, init)], NodeFlags.Const));
+    }
+
+    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: StringLiteralLike, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): Node[] {
         //At each use:
         //If it's `name.foo`: use a named binding to "foo"
         //If it's anything else (e.g. `name()`): use a default import
@@ -182,10 +315,10 @@ namespace ts.refactor.installTypesForPackage {
             // If it was unused, ensure that we at least import *something*.
             needDefaultImport = true;
         }
-        return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, moduleSpecifier)];
+        return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, createLiteral(moduleSpecifier))];
     }
 
-    function nameFromModuleSpecifier(moduleSpecifier: StringLiteral, identifiers: Identifiers) {
+    function nameFromModuleSpecifier(moduleSpecifier: StringLiteralLike, identifiers: Identifiers) {
         return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier.text), identifiers);
     }
 

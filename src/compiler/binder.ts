@@ -1721,6 +1721,7 @@ namespace ts {
 
         // The binder visits every node in the syntax tree so it is a convenient place to perform a single localized
         // check for reserved words used as identifiers in strict mode code.
+        //!
         function checkStrictModeIdentifier(node: Identifier) {
             if (inStrictMode &&
                 node.originalKeywordKind >= SyntaxKind.FirstFutureReservedWord &&
