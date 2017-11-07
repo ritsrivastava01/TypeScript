@@ -3810,7 +3810,7 @@
         "category": "Message",
         "code": 95016
     },
-    "Convert to ES module": {
+    "Convert to ES6 module": {
         "category": "Message",
         "code": 95017
     }
