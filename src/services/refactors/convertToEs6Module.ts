@@ -133,6 +133,7 @@ namespace ts.refactor.installTypesForPackage {
                     }
                     break;
                 case SyntaxKind.VariableStatement: {
+                    //-> own fn
                     const { declarations } = (statement as VariableStatement).declarationList;
                     let didFindRequire = false;
                     const newNodes = flatMap(declarations, decl => {
@@ -158,57 +159,73 @@ namespace ts.refactor.installTypesForPackage {
                     break;
                 }
                 case SyntaxKind.ExpressionStatement: {
-                    const { expression } = statement as ExpressionStatement;
-                    if (!isBinaryExpression(expression)) {
-                        break;
+                    const { expression } = statement as ExpressionStatement
+                    if (isBinaryExpression(expression) && expression.operatorToken.kind === SyntaxKind.EqualsToken) {
+                        const x = doAssignment(file, statement as ExpressionStatement, expression, changes, identifiers); //name
+                        moduleExportsChangedToDefault = moduleExportsChangedToDefault || x;
                     }
-                    const { left, operatorToken, right } = expression;
-                    if (operatorToken.kind !== SyntaxKind.EqualsToken || !isPropertyAccessExpression(left) || !isIdentifier(left.expression)) {
-                        break;
-                    }
-                    switch (left.expression.text) {
-                        case "module":
-                            if (left.name.text === "exports") {
-                                if (isObjectLiteralExpression(right)) {
-                                    const x = doModuleExportsObject(right); //name
-                                    if (x) {
-                                        changes.replaceNodeWithNodes(file, statement, x, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
-                                        break;
-                                    }
-                                }
-
-                                moduleExportsChangedToDefault = true;
-                                changes.replaceNode(file, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
-                            }
-                            break;
-                        case "exports": {
-                            // If "originalKeywordKind" was set, this is e.g. `exports.
-                            const { originalKeywordKind, text } = left.name;
-                            if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
-                                /*
-                                const _class = 0;
-                                export { _class as class };
-                                */
-                                const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
-                                const newNodes = [
-                                    makeConst(/*modifiers*/ undefined, tmp, right),
-                                    createExportDeclaration(
-                                        /*decorators*/ undefined,
-                                        /*modifiers*/ undefined,
-                                        createNamedExports([createExportSpecifier(tmp, text)])),
-                                ];
-                                changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
-                            }
-                            else {
-                                changes.replaceNode(file, statement, doExportsDotXEquals(text, right), { useNonAdjustedEndPosition: true });
-                            }
-                            break;
-                        }
-                    }
+                    break;
                 }
+                case SyntaxKind.VariableDeclaration:
+                    //`const alias = module.exports;` --> nothing
             }
         }
         return moduleExportsChangedToDefault;
+    }
+
+    function doAssignment(sourceFile: SourceFile, statement: ExpressionStatement, expression: BinaryExpression, changes: textChanges.ChangeTracker, identifiers: Identifiers): boolean {
+        const { left, right } = expression;
+        if (!isPropertyAccessExpression(left)) {
+            return false;
+        }
+
+        if (isExportsOrModuleExportsOrAlias(sourceFile, left)) {
+            if (isExportsOrModuleExportsOrAlias(sourceFile, right)) {
+                //`const alias = module.exports;` or `module.exports = alias;` can be removed.
+                changes.deleteNode(sourceFile, statement);
+            }
+            else {
+                let x: ReadonlyArray<Statement> | undefined;
+                if (isObjectLiteralExpression(right)) {
+                    x = doModuleExportsObject(right); //name
+                    if (x) {
+                        changes.replaceNodeWithNodes(sourceFile, statement, x, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+                    }
+                }
+                if (!x) { //neater
+                    changes.replaceNode(sourceFile, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
+                    return true;
+                }
+            }
+        }
+        else if (isExportsOrModuleExportsOrAlias(sourceFile, left.expression)) {
+            fooNamedExport(sourceFile, statement, left.name, right, changes, identifiers);
+        }
+
+        return false;
+    }
+
+    function fooNamedExport(sourceFile: SourceFile, statement: Statement, propertyName: Identifier, right: Expression, changes: textChanges.ChangeTracker, identifiers: Identifiers) { //name
+        // If "originalKeywordKind" was set, this is e.g. `exports.
+        const { originalKeywordKind, text } = propertyName;
+        if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+            /*
+            const _class = 0;
+            export { _class as class };
+            */
+            const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
+            const newNodes = [
+                makeConst(/*modifiers*/ undefined, tmp, right),
+                createExportDeclaration(
+                    /*decorators*/ undefined,
+                    /*modifiers*/ undefined,
+                    createNamedExports([createExportSpecifier(tmp, text)])),
+            ];
+            changes.replaceNodeWithNodes(sourceFile, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+        }
+        else {
+            changes.replaceNode(sourceFile, statement, doExportsDotXEquals(text, right), { useNonAdjustedEndPosition: true });
+        }
     }
 
     //mv
@@ -239,10 +256,8 @@ namespace ts.refactor.installTypesForPackage {
             : makeImport(undefined, [makeImportSpecifier(propertyName, name)], moduleSpecifier);
     }
 
-
-
     //!
-    function doModuleExportsObject(object: ObjectLiteralExpression): Statement[] | undefined {
+    function doModuleExportsObject(object: ObjectLiteralExpression): ReadonlyArray<Statement> | undefined {
         return mapAllOrFail(object.properties, prop => {
             switch (prop.kind) {
                 case SyntaxKind.GetAccessor:
@@ -382,7 +397,7 @@ namespace ts.refactor.installTypesForPackage {
             createVariableDeclarationList([createVariableDeclaration(name, /*type*/ undefined, init)], NodeFlags.Const));
     }
 
-    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: StringLiteralLike, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): Node[] {
+    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: StringLiteralLike, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): ReadonlyArray<Node> {
         //At each use:
         //If it's `name.foo`: use a named binding to "foo"
         //If it's anything else (e.g. `name()`): use a default import
@@ -428,7 +443,7 @@ namespace ts.refactor.installTypesForPackage {
         return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, createLiteral(moduleSpecifier))];
     }
 
-    function nameFromModuleSpecifier(moduleSpecifier: StringLiteralLike, identifiers: Identifiers) {
+    function nameFromModuleSpecifier(moduleSpecifier: StringLiteralLike, identifiers: Identifiers): string {
         return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier.text), identifiers);
     }
 
