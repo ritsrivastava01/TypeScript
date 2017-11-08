@@ -32,7 +32,6 @@ namespace ts.refactor {
         ];
     }
 
-    //TODO: probably activate at more places.
     function isAtTriggerLocation(sourceFile: SourceFile, node: Node) {
         if (isExpression(node) && isExportsOrModuleExportsOrAlias(sourceFile, node)) {
             return true;
@@ -121,6 +120,60 @@ namespace ts.refactor {
     /** @returns Whether we converted a `module.exports =` to a default export. */
     function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): boolean {
         const identifiers: Identifiers = { original: collectFreeIdentifiers(sourceFile), additional: createMap<true>() };
+        const exports = collectExportsAccesses(sourceFile, checker, identifiers);
+        changeExportsAccesses(sourceFile, exports, changes);
+        const moduleExportsChangedToDefault = doStatements(sourceFile, checker, changes, identifiers, exports);
+        return moduleExportsChangedToDefault;
+    }
+
+    //Contains an entry for each renamed export.
+    type ExportRenames = ReadonlyMap<string>; //name
+
+    function collectExportsAccesses(sourceFile: SourceFile, checker: TypeChecker, identifiers: Identifiers): ExportRenames {
+        const res = createMap<string>();
+        forEachExportReference(sourceFile, node => {
+            const { text, originalKeywordKind } = node.name;
+            if (res.has(text)) {
+                return;
+            }
+
+            if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+                res.set(text, makeUniqueName(`_${text}`, identifiers));
+            }
+            else {
+                if (checker.resolveName(node.name.text, node, SymbolFlags.Value, /*includeGlobals*/ false)) {
+                    // This name already exists, must rename.
+                    res.set(text, makeUniqueName(`_${text}`, identifiers)); //dup code...
+                }
+            }
+        });
+        return res;
+    }
+
+    //todo: 'default' will be funny?
+    function changeExportsAccesses(sourceFile: SourceFile, exports: ExportRenames, changes: textChanges.ChangeTracker): void {
+        forEachExportReference(sourceFile, (node, isAssign) => {
+            if (isAssign) {
+                return;
+            }
+
+            const { text } = node.name;
+            changes.replaceNode(sourceFile, node, createIdentifier(exports.get(text) || node.name.text));
+        });
+    }
+
+    function forEachExportReference(sourceFile: SourceFile, cb: (node: PropertyAccessExpression, isAssign: boolean) => void) {
+        sourceFile.forEachChild(function recur(node) {
+            if (isPropertyAccessExpression(node) && isExportsOrModuleExportsOrAlias(sourceFile, node.expression)) {
+                const { parent } = node;
+                cb(node, isBinaryExpression(parent) && parent.left === node && parent.operatorToken.kind === SyntaxKind.EqualsToken);
+            }
+            node.forEachChild(recur);
+        });
+    }
+
+    //name
+    function doStatements(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker, identifiers: Identifiers, exports: ExportRenames): boolean {
         let moduleExportsChangedToDefault = false;
         for (const statement of sourceFile.statements) {
             switch (statement.kind) {
@@ -136,7 +189,7 @@ namespace ts.refactor {
                 case SyntaxKind.ExpressionStatement: {
                     const { expression } = statement as ExpressionStatement
                     if (isBinaryExpression(expression) && expression.operatorToken.kind === SyntaxKind.EqualsToken) {
-                        const x = doAssignment(sourceFile, statement as ExpressionStatement, expression, changes, identifiers); //name
+                        const x = doAssignment(sourceFile, statement as ExpressionStatement, expression, changes, exports); //name
                         moduleExportsChangedToDefault = moduleExportsChangedToDefault || x;
                     }
                     break;
@@ -177,7 +230,14 @@ namespace ts.refactor {
     }
 
     //name
-    function doAssignment(sourceFile: SourceFile, statement: ExpressionStatement, expression: BinaryExpression, changes: textChanges.ChangeTracker, identifiers: Identifiers): boolean {
+    //document return value
+    function doAssignment(
+        sourceFile: SourceFile,
+        statement: ExpressionStatement,
+        expression: BinaryExpression,
+        changes: textChanges.ChangeTracker,
+        exports: ExportRenames,
+    ): boolean {
         const { left, right } = expression;
         if (!isPropertyAccessExpression(left)) {
             return false;
@@ -203,27 +263,34 @@ namespace ts.refactor {
             }
         }
         else if (isExportsOrModuleExportsOrAlias(sourceFile, left.expression)) {
-            fooNamedExport(sourceFile, statement, left.name, right, changes, identifiers);
+            doNamedExport(sourceFile, statement, left.name, right, changes, exports);
         }
 
         return false;
     }
 
-    function fooNamedExport(sourceFile: SourceFile, statement: Statement, propertyName: Identifier, right: Expression, changes: textChanges.ChangeTracker, identifiers: Identifiers) { //name
+    function doNamedExport(
+        sourceFile: SourceFile,
+        statement: Statement,
+        propertyName: Identifier,
+        right: Expression,
+        changes: textChanges.ChangeTracker,
+        exports: ExportRenames,
+    ) { //name
         // If "originalKeywordKind" was set, this is e.g. `exports.
-        const { originalKeywordKind, text } = propertyName;
-        if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+        const { text } = propertyName;
+        const rename = exports.get(text);
+        if (rename !== undefined) {
             /*
             const _class = 0;
             export { _class as class };
             */
-            const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
             const newNodes = [
-                makeConst(/*modifiers*/ undefined, tmp, right),
+                makeConst(/*modifiers*/ undefined, rename, right),
                 createExportDeclaration(
                     /*decorators*/ undefined,
                     /*modifiers*/ undefined,
-                    createNamedExports([createExportSpecifier(tmp, text)])),
+                    createNamedExports([createExportSpecifier(rename, text)])),
             ];
             changes.replaceNodeWithNodes(sourceFile, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
         }
