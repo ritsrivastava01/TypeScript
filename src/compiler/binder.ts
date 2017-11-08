@@ -2589,8 +2589,7 @@ namespace ts {
             isIdentifier(node) && isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile, node);
     }
 
-    /* @internal */
-    export function isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile: SourceFile, node: Identifier): boolean {
+    function isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile: SourceFile, node: Identifier): boolean {
         //lookupSymbolForName only looks in the current container. So don't bother if that's not the source file.
         const symbol = lookupSymbolForNameWorker(sourceFile, node.escapedText);
         return symbol && symbol.valueDeclaration && isVariableDeclaration(symbol.valueDeclaration) &&

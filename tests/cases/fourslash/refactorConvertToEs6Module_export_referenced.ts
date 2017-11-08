@@ -5,16 +5,16 @@
 // @allowJs: true
 
 // @Filename: /a.js
-////const exportsAlias = exports;
-////exportsAlias.f = function() {};
-/////*a*/module/*b*/.exports = exportsAlias;
+////const x = 0;
+/////*a*/exports/*b*/.x = 1;
 
 goTo.select("a", "b");
 edit.applyRefactor({
     refactorName: "Convert to ES6 module",
     actionName: "Convert to ES6 module",
     actionDescription: "Convert to ES6 module",
-    newContent: `
-export function f() { }
+    newContent: `const x = 0;
+const _x = 1;
+export { _x as x };
 `,
 });
