@@ -49,7 +49,8 @@ namespace ts.refactor.installTypesForPackage {
         if (!isRequireCall(call, /*checkArgumentIsStringLiteral*/ true)) {
             return false;
         }
-        const { parent: varDecl } = call;
+        const { parent: propAccess } = call;
+        const varDecl = isPropertyAccessExpression(propAccess) ? propAccess.parent : propAccess;
         if (!isVariableDeclaration(varDecl)) {
             return false;
         }
@@ -83,81 +84,184 @@ namespace ts.refactor.installTypesForPackage {
         Debug.assertEqual(actionName, _actionName);
         const { file, program } = context;
         Debug.assert(isSourceFileJavaScript(file));
-
-        const checker = program.getTypeChecker();
-        const identifiers: Identifiers = { original: collectFreeIdentifiers(file), additional: createMap<true>() };
         const edits = textChanges.ChangeTracker.with(context, changes => {
-            for (const statement of file.statements) {
-                switch (statement.kind) {
-                    case SyntaxKind.CallExpression:
-                        if (isRequireCall(statement, /*checkArgumentIsStringLiteral*/ true)) {
-                            // For side-effecting require() call, just make a side-effecting import.
-                            changes.replaceNode(file, statement, makeImport(/*name*/ undefined, /*namedImports*/ undefined, statement.expression));
-                        }
-                        break;
-                    case SyntaxKind.VariableStatement: {
-                        const { declarations } = (statement as VariableStatement).declarationList;
-                        let didFindRequire = false;
-                        const newNodes = flatMap(declarations, decl => {
-                            if (isRequireCall(decl.initializer, /*checkArgumentIsStringLiteral*/ true)) {
-                                didFindRequire = true;
-                                return doSingleImport(file, decl, getSynthesizedDeepClone(decl.initializer.arguments[0] as StringLiteral), changes, checker, identifiers);
-                            }
-                            else {
-                                //test -- some unrelated declaration should basically be left alone.
-                                return createVariableStatement(undefined, [decl]);
-                            }
-                        });
-                        if (didFindRequire) { //else leave it alone
-                            // useNonAdjustedEndPosition to ensure we don't eat the newline after the statement.
-                            changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
-                        }
-                        break;
-                    }
-                    case SyntaxKind.ExpressionStatement: {
-                        const { expression } = statement as ExpressionStatement;
-                        if (!isBinaryExpression(expression)) {
-                            break;
-                        }
-                        const { left, operatorToken, right } = expression;
-                        if (operatorToken.kind !== SyntaxKind.EqualsToken || !isPropertyAccessExpression(left) || !isIdentifier(left.expression)) {
-                            break;
-                        }
-                        switch (left.expression.text) {
-                            case "module":
-                                if (left.name.text === "exports") {
-                                    changes.replaceNode(file, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
-                                }
-                                break;
-                            case "exports": {
-                                // If "originalKeywordKind" was set, this is e.g. `exports.
-                                const { originalKeywordKind, text } = left.name;
-                                if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
-                                    /*
-                                    const _class = 0;
-                                    export { _class as class };
-                                    */
-                                    const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
-                                    const newNodes = [
-                                        makeConst(/*modifiers*/ undefined, tmp, right),
-                                        createExportDeclaration(
-                                            /*decorators*/ undefined,
-                                            /*modifiers*/ undefined,
-                                            createNamedExports([createExportSpecifier(tmp, text)])),
-                                    ];
-                                    changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
-                                }
-                                else {
-                                    changes.replaceNode(file, statement, doExportsDotXEquals(text, right), { useNonAdjustedEndPosition: true });
-                                }
-                                break;
-                            }
-                        }
-                    }
+            const moduleExportsChangedToDefault = convertFileToEs6Module(file, program.getTypeChecker(), changes);
+            if (moduleExportsChangedToDefault) {
+                for (const importingFile of program.getSourceFiles()) {
+                    fixImportOfModuleExports(importingFile, file, changes);
                 }
             }
         });
         return { edits, renameFilename: undefined, renameLocation: undefined }
+    }
+
+    function fixImportOfModuleExports(importingFile: ts.SourceFile, exportingFile: ts.SourceFile, changes: textChanges.ChangeTracker) {
+        for (const moduleSpecifier of importingFile.imports) {
+            const imported = getResolvedModule(importingFile, moduleSpecifier.text);
+            if (!imported || imported.resolvedFileName !== exportingFile.fileName) {
+                continue;
+            }
+
+            const { parent } = moduleSpecifier;
+            switch (parent.kind) {
+                case SyntaxKind.ExternalModuleReference: {
+                    const importEq = (parent as ExternalModuleReference).parent;
+                    changes.replaceNode(importingFile, importEq, makeImport(importEq.name, /*namedImports*/ undefined, moduleSpecifier));
+                    break;
+                }
+                case SyntaxKind.CallExpression: {
+                    const call = parent as CallExpression;
+                    if (isRequireCall(call, /*checkArgumentIsStringLiteral*/ false)) {
+                        changes.replaceNode(importingFile, parent, createPropertyAccess(getSynthesizedDeepClone(call), "default"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /** @returns Whether we converted a `module.exports =` to a default export. */
+    function convertFileToEs6Module(file: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): boolean {
+        const identifiers: Identifiers = { original: collectFreeIdentifiers(file), additional: createMap<true>() };
+        let moduleExportsChangedToDefault = false;
+        for (const statement of file.statements) {
+            switch (statement.kind) {
+                case SyntaxKind.CallExpression:
+                    if (isRequireCall(statement, /*checkArgumentIsStringLiteral*/ true)) {
+                        // For side-effecting require() call, just make a side-effecting import.
+                        changes.replaceNode(file, statement, makeImport(/*name*/ undefined, /*namedImports*/ undefined, statement.expression));
+                    }
+                    break;
+                case SyntaxKind.VariableStatement: {
+                    const { declarations } = (statement as VariableStatement).declarationList;
+                    let didFindRequire = false;
+                    const newNodes = flatMap(declarations, decl => {
+                        const { name, initializer } = decl;
+                        if (isRequireCall(initializer, /*checkArgumentIsStringLiteral*/ true)) {
+                            didFindRequire = true;
+                            //todo: pass module specifier as string, not node
+                            return doSingleImport(file, name, getSynthesizedDeepClone(initializer.arguments[0]), changes, checker, identifiers);
+                        }
+                        else if (isPropertyAccessExpression(initializer) && isRequireCall(initializer.expression, /*checkArgumentIsStringLiteral*/ true)) {
+                            didFindRequire = true;
+                            return doPropertyAccessImport(name, initializer.name.text, createLiteral(initializer.expression.arguments[0]), identifiers);
+                        }
+                        else {
+                            //test -- some unrelated declaration should be left alone.
+                            return createVariableStatement(undefined, [decl]);
+                        }
+                    });
+                    if (didFindRequire) { //else leave it alone
+                        // useNonAdjustedEndPosition to ensure we don't eat the newline after the statement.
+                        changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+                    }
+                    break;
+                }
+                case SyntaxKind.ExpressionStatement: {
+                    const { expression } = statement as ExpressionStatement;
+                    if (!isBinaryExpression(expression)) {
+                        break;
+                    }
+                    const { left, operatorToken, right } = expression;
+                    if (operatorToken.kind !== SyntaxKind.EqualsToken || !isPropertyAccessExpression(left) || !isIdentifier(left.expression)) {
+                        break;
+                    }
+                    switch (left.expression.text) {
+                        case "module":
+                            if (left.name.text === "exports") {
+                                if (isObjectLiteralExpression(right)) {
+                                    const x = doModuleExportsObject(right); //name
+                                    if (x) {
+                                        changes.replaceNodeWithNodes(file, statement, x, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+                                        break;
+                                    }
+                                }
+
+                                moduleExportsChangedToDefault = true;
+                                changes.replaceNode(file, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
+                            }
+                            break;
+                        case "exports": {
+                            // If "originalKeywordKind" was set, this is e.g. `exports.
+                            const { originalKeywordKind, text } = left.name;
+                            if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+                                /*
+                                const _class = 0;
+                                export { _class as class };
+                                */
+                                const tmp = makeUniqueName(`_${text}`, identifiers); // e.g. _class
+                                const newNodes = [
+                                    makeConst(/*modifiers*/ undefined, tmp, right),
+                                    createExportDeclaration(
+                                        /*decorators*/ undefined,
+                                        /*modifiers*/ undefined,
+                                        createNamedExports([createExportSpecifier(tmp, text)])),
+                                ];
+                                changes.replaceNodeWithNodes(file, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
+                            }
+                            else {
+                                changes.replaceNode(file, statement, doExportsDotXEquals(text, right), { useNonAdjustedEndPosition: true });
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return moduleExportsChangedToDefault;
+    }
+
+    //mv
+    function doPropertyAccessImport(name: BindingName, propertyName: string, moduleSpecifier: StringLiteral, identifiers: Identifiers): ReadonlyArray<Node> {
+        switch (name.kind) {
+            case SyntaxKind.ObjectBindingPattern:
+            case SyntaxKind.ArrayBindingPattern: {
+                // `const [a, b] = require("c").d` --> `import { d } from "c"; const [a, b] = d;`
+                const tmp  = makeUniqueName(propertyName, identifiers);
+                return [
+                    makeMeAnImport(tmp, propertyName, moduleSpecifier),
+                    //TODO: use the var/let/const kind from the original
+                    makeConst(/*modifiers*/ undefined, name, createIdentifier(tmp)),
+                ];
+            }
+            case SyntaxKind.Identifier:
+                // `const a = require("b").c` --> `import { c as a } from "./b";
+                return [makeMeAnImport(name.text, propertyName, moduleSpecifier)];
+            default:
+                Debug.assertNever(name);
+        }
+    }
+
+    //!
+    function makeMeAnImport(name: string, propertyName: string, moduleSpecifier: StringLiteral): ImportDeclaration {
+        return propertyName === "default"
+            ? makeImport(createIdentifier(name), /*namedImports*/ undefined, moduleSpecifier)
+            : makeImport(undefined, [makeImportSpecifier(propertyName, name)], moduleSpecifier);
+    }
+
+
+
+    //!
+    function doModuleExportsObject(object: ObjectLiteralExpression): Statement[] | undefined {
+        return mapAllOrFail(object.properties, prop => {
+            switch (prop.kind) {
+                case SyntaxKind.GetAccessor:
+                case SyntaxKind.SetAccessor:
+                case SyntaxKind.ShorthandPropertyAssignment: //TODO: handle?
+                case SyntaxKind.SpreadAssignment:
+                    return undefined;
+                case SyntaxKind.PropertyAssignment: {
+                    const { name, initializer } = prop as PropertyAssignment;
+                    return !isIdentifier(name) ? undefined : doExportsDotXEquals(name.text, initializer);
+                }
+                case SyntaxKind.MethodDeclaration: {
+                    const m = prop as MethodDeclaration; //name
+                    return !isIdentifier(m.name) ? undefined : makeFunctionDeclaration(m.name.text, [createToken(SyntaxKind.ExportKeyword)], m);
+                }
+                default:
+                    Debug.assertNever(prop);
+            }
+        });
     }
 
     function doModuleExports(exported: Expression): Statement {
@@ -202,7 +306,8 @@ namespace ts.refactor.installTypesForPackage {
         }
     }
 
-    function makeFunctionDeclaration(name: string | undefined, additionalModifiers: ReadonlyArray<Modifier>, fn: FunctionExpression | ArrowFunction): FunctionDeclaration {
+    function makeFunctionDeclaration(name: string | undefined, additionalModifiers: ReadonlyArray<Modifier>, fn: FunctionExpression | ArrowFunction | MethodDeclaration): FunctionDeclaration {
+        //Test that we're correctly copying over e.g. `async function* f()`
         return createFunctionDeclaration(
             getSynthesizedDeepClones(fn.decorators),
             concatenate(additionalModifiers, getSynthesizedDeepClones(fn.modifiers)),
@@ -230,18 +335,18 @@ namespace ts.refactor.installTypesForPackage {
      */
     function doSingleImport(
         file: SourceFile,
-        vd: VariableDeclaration,
+        name: BindingName,
         moduleSpecifier: StringLiteralLike,
         changes: textChanges.ChangeTracker,
         checker: TypeChecker,
         identifiers: Identifiers,
     ): ReadonlyArray<Node> {
-        switch (vd.name.kind) {
+        switch (name.kind) {
             case SyntaxKind.ObjectBindingPattern: {
-                const importSpecifiers = mapAllOrFail(vd.name.elements, e =>
+                const importSpecifiers = mapAllOrFail(name.elements, e =>
                     e.dotDotDotToken || e.initializer || e.propertyName && !isIdentifier(e.propertyName) || !isIdentifier(e.name)
                         ? undefined
-                        : createImportSpecifier(getSynthesizedDeepClone(e.propertyName as Identifier), getSynthesizedDeepClone(e.name)));
+                        : makeImportSpecifier(e.propertyName && (e.propertyName as Identifier).text, e.name.text));
                 if (importSpecifiers) {
                     return [makeImport(/*name*/ undefined, importSpecifiers, moduleSpecifier)];
                 }
@@ -252,17 +357,22 @@ namespace ts.refactor.installTypesForPackage {
                 import x from "x";
                 const [a, b, c] = x;
                 */
-                const name = nameFromModuleSpecifier(moduleSpecifier, identifiers);
+                const tmp = nameFromModuleSpecifier(moduleSpecifier, identifiers); //name
                 return [
-                    makeImport(createIdentifier(name), /*namedImports*/ undefined, moduleSpecifier),
-                    makeConst(/*modifiers*/ undefined, getSynthesizedDeepClone(vd.name), createIdentifier(name)),
+                    makeImport(createIdentifier(tmp), /*namedImports*/ undefined, moduleSpecifier),
+                    makeConst(/*modifiers*/ undefined, getSynthesizedDeepClone(name), createIdentifier(tmp)),
                 ];
             }
             case SyntaxKind.Identifier:
-                return doSingleIdentifierImport(file, vd.name, moduleSpecifier, changes, checker, identifiers);
+                return doSingleIdentifierImport(file, name, moduleSpecifier, changes, checker, identifiers);
             default:
-                Debug.assertNever(vd.name);
+                Debug.assertNever(name);
         }
+    }
+
+    //mv
+    function makeImportSpecifier(propertyName: string | undefined, name: string): ImportSpecifier {
+        return createImportSpecifier(propertyName !== undefined && propertyName !== name ? createIdentifier(propertyName) : undefined, createIdentifier(name));
     }
 
     //move
