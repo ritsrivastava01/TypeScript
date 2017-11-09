@@ -32,7 +32,7 @@ namespace ts.refactor {
         ];
     }
 
-    function isAtTriggerLocation(sourceFile: SourceFile, node: Node) {
+    function isAtTriggerLocation(sourceFile: SourceFile, node: Node): boolean {
         if (isExpression(node) && isExportsOrModuleExportsOrAlias(sourceFile, node)) {
             return true;
         }
@@ -66,6 +66,9 @@ namespace ts.refactor {
         }
         const { parent: propAccess } = call;
         const varDecl = isPropertyAccessExpression(propAccess) ? propAccess.parent : propAccess;
+        if (isSourceFile(varDecl)) {
+            return true;
+        }
         if (!isVariableDeclaration(varDecl)) {
             return false;
         }
@@ -89,7 +92,7 @@ namespace ts.refactor {
                 }
             }
         });
-        return { edits, renameFilename: undefined, renameLocation: undefined }
+        return { edits, renameFilename: undefined, renameLocation: undefined };
     }
 
     function fixImportOfModuleExports(importingFile: ts.SourceFile, exportingFile: ts.SourceFile, changes: textChanges.ChangeTracker) {
@@ -103,7 +106,7 @@ namespace ts.refactor {
             switch (parent.kind) {
                 case SyntaxKind.ExternalModuleReference: {
                     const importEq = (parent as ExternalModuleReference).parent;
-                    changes.replaceNode(importingFile, importEq, makeImport(importEq.name, /*namedImports*/ undefined, moduleSpecifier));
+                    changes.replaceNode(importingFile, importEq, makeImport(importEq.name, /*namedImports*/ undefined, moduleSpecifier.text));
                     break;
                 }
                 case SyntaxKind.CallExpression: {
@@ -118,11 +121,15 @@ namespace ts.refactor {
     }
 
     /** @returns Whether we converted a `module.exports =` to a default export. */
-    function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): boolean {
+    function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): ModuleExportsChanged {
         const identifiers: Identifiers = { original: collectFreeIdentifiers(sourceFile), additional: createMap<true>() };
         const exports = collectExportRenames(sourceFile, checker, identifiers);
         changeExportsAccesses(sourceFile, exports, changes);
-        const moduleExportsChangedToDefault = doStatements(sourceFile, checker, changes, identifiers, exports);
+        let moduleExportsChangedToDefault = false;
+        for (const statement of sourceFile.statements) {
+            const moduleExportsChanged = changeStatement(sourceFile, statement, checker, changes, identifiers, exports);
+            moduleExportsChangedToDefault = moduleExportsChangedToDefault || moduleExportsChanged;
+        }
         return moduleExportsChangedToDefault;
     }
 
@@ -149,19 +156,17 @@ namespace ts.refactor {
         return res;
     }
 
-    //todo: 'default' will be funny?
     function changeExportsAccesses(sourceFile: SourceFile, exports: ExportRenames, changes: textChanges.ChangeTracker): void {
-        forEachExportReference(sourceFile, (node, isAssign) => {
-            if (isAssign) {
+        forEachExportReference(sourceFile, (node, isAssignment) => {
+            if (isAssignment) {
                 return;
             }
-
             const { text } = node.name;
-            changes.replaceNode(sourceFile, node, createIdentifier(exports.get(text) || node.name.text));
+            changes.replaceNode(sourceFile, node, createIdentifier(exports.get(text) || text));
         });
     }
 
-    function forEachExportReference(sourceFile: SourceFile, cb: (node: PropertyAccessExpression, isAssign: boolean) => void) {
+    function forEachExportReference(sourceFile: SourceFile, cb: (node: PropertyAccessExpression, isAssignment: boolean) => void): void {
         sourceFile.forEachChild(function recur(node) {
             if (isPropertyAccessExpression(node) && isExportsOrModuleExportsOrAlias(sourceFile, node.expression)) {
                 const { parent } = node;
@@ -171,72 +176,63 @@ namespace ts.refactor {
         });
     }
 
-    //name
-    function doStatements(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker, identifiers: Identifiers, exports: ExportRenames): boolean {
-        let moduleExportsChangedToDefault = false;
-        for (const statement of sourceFile.statements) {
-            switch (statement.kind) {
-                case SyntaxKind.CallExpression:
-                    if (isRequireCall(statement, /*checkArgumentIsStringLiteral*/ true)) {
-                        // For side-effecting require() call, just make a side-effecting import.
-                        changes.replaceNode(sourceFile, statement, makeImport(/*name*/ undefined, /*namedImports*/ undefined, statement.expression));
-                    }
-                    break;
-                case SyntaxKind.VariableStatement:
-                    doVariableStatement(sourceFile, statement as VariableStatement, changes, checker, identifiers);
-                    break;
-                case SyntaxKind.ExpressionStatement: {
-                    const { expression } = statement as ExpressionStatement
-                    if (isBinaryExpression(expression) && expression.operatorToken.kind === SyntaxKind.EqualsToken) {
-                        const x = doAssignment(sourceFile, statement as ExpressionStatement, expression, changes, exports); //name
-                        moduleExportsChangedToDefault = moduleExportsChangedToDefault || x;
-                    }
-                    break;
+    /** Whether `module.exports =` was changed to `export default` */
+    type ModuleExportsChanged = boolean;
+
+    function changeStatement(sourceFile: SourceFile, statement: Statement, checker: TypeChecker, changes: textChanges.ChangeTracker, identifiers: Identifiers, exports: ExportRenames): ModuleExportsChanged {
+        switch (statement.kind) {
+            case SyntaxKind.CallExpression:
+                if (isRequireCall(statement, /*checkArgumentIsStringLiteral*/ true)) {
+                    // For side-effecting require() call, just make a side-effecting import.
+                    changes.replaceNode(sourceFile, statement, makeImport(/*name*/ undefined, /*namedImports*/ undefined, statement.arguments[0].text));
                 }
+                return false;
+            case SyntaxKind.VariableStatement:
+                doVariableStatement(sourceFile, statement as VariableStatement, changes, checker, identifiers);
+                return false;
+            case SyntaxKind.ExpressionStatement: {
+                const { expression } = statement as ExpressionStatement
+                return isBinaryExpression(expression) && expression.operatorToken.kind === SyntaxKind.EqualsToken && changeAssignment(sourceFile, statement as ExpressionStatement, expression, changes, exports);
             }
         }
-        return moduleExportsChangedToDefault;
     }
 
     function doVariableStatement(sourceFile: SourceFile, statement: VariableStatement, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): void {
-        const { declarations } = (statement as VariableStatement).declarationList;
-        let didChange = false;
-        const newNodes = flatMap(declarations, decl => {
+        const { declarationList } = statement as VariableStatement;
+        let foundImport = false;
+        const newNodes = flatMap(declarationList.declarations, decl => {
             const { name, initializer } = decl;
             if (isExportsOrModuleExportsOrAlias(sourceFile, initializer)) {
                 // `const alias = module.exports;` can be removed.
-                didChange = true;
+                foundImport = true;
                 return [];
             }
             if (isRequireCall(initializer, /*checkArgumentIsStringLiteral*/ true)) {
-                didChange = true;
-                //todo: pass module specifier as string, not node
-                return doSingleImport(sourceFile, name, getSynthesizedDeepClone(initializer.arguments[0]), changes, checker, identifiers);
+                foundImport = true;
+                return doSingleImport(sourceFile, name, initializer.arguments[0].text, changes, checker, identifiers);
             }
             else if (isPropertyAccessExpression(initializer) && isRequireCall(initializer.expression, /*checkArgumentIsStringLiteral*/ true)) {
-                didChange = true;
-                return doPropertyAccessImport(name, initializer.name.text, createLiteral(initializer.expression.arguments[0]), identifiers);
+                foundImport = true;
+                return doPropertyAccessImport(name, initializer.name.text, initializer.expression.arguments[0].text, identifiers);
             }
             else {
-                //test -- some unrelated declaration should be left alone.
-                return createVariableStatement(/*modifiers*/ undefined, [decl]);
+                // Move it out to its own variable statement.
+                return createVariableStatement(/*modifiers*/ undefined, createVariableDeclarationList([decl], declarationList.flags));
             }
         });
-        if (didChange) { //else leave it alone
+        if (foundImport) {
             // useNonAdjustedEndPosition to ensure we don't eat the newline after the statement.
             changes.replaceNodeWithNodes(sourceFile, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
         }
     }
 
-    //name
-    //document return value
-    function doAssignment(
+    function changeAssignment(
         sourceFile: SourceFile,
         statement: ExpressionStatement,
         expression: BinaryExpression,
         changes: textChanges.ChangeTracker,
         exports: ExportRenames,
-    ): boolean {
+    ): ModuleExportsChanged {
         const { left, right } = expression;
         if (!isPropertyAccessExpression(left)) {
             return false;
@@ -248,15 +244,12 @@ namespace ts.refactor {
                 changes.deleteNode(sourceFile, statement);
             }
             else {
-                let x: ReadonlyArray<Statement> | undefined;
-                if (isObjectLiteralExpression(right)) {
-                    x = doModuleExportsObject(right); //name
-                    if (x) {
-                        changes.replaceNodeWithNodes(sourceFile, statement, x, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
-                    }
+                const newNodes = isObjectLiteralExpression(right) ? tryChangeModuleExportsObject(right) : undefined;
+                if (newNodes) {
+                    changes.replaceNodeWithNodes(sourceFile, statement, newNodes, { nodeSeparator: "\n", useNonAdjustedEndPosition: true });
                 }
-                if (!x) { //neater
-                    changes.replaceNode(sourceFile, statement, doModuleExports(right), { useNonAdjustedEndPosition: true });
+                else {
+                    changes.replaceNode(sourceFile, statement, changeModuleExportsToExportDefault(right), { useNonAdjustedEndPosition: true });
                     return true;
                 }
             }
@@ -299,7 +292,7 @@ namespace ts.refactor {
     }
 
     //mv
-    function doPropertyAccessImport(name: BindingName, propertyName: string, moduleSpecifier: StringLiteral, identifiers: Identifiers): ReadonlyArray<Node> {
+    function doPropertyAccessImport(name: BindingName, propertyName: string, moduleSpecifier: string, identifiers: Identifiers): ReadonlyArray<Node> {
         switch (name.kind) {
             case SyntaxKind.ObjectBindingPattern:
             case SyntaxKind.ArrayBindingPattern: {
@@ -319,14 +312,14 @@ namespace ts.refactor {
     }
 
     //!
-    function makeMeAnImport(name: string, propertyName: string, moduleSpecifier: StringLiteral): ImportDeclaration {
+    function makeMeAnImport(name: string, propertyName: string, moduleSpecifier: string): ImportDeclaration {
         return propertyName === "default"
             ? makeImport(createIdentifier(name), /*namedImports*/ undefined, moduleSpecifier)
             : makeImport(/*name*/ undefined, [makeImportSpecifier(propertyName, name)], moduleSpecifier);
     }
 
     //!
-    function doModuleExportsObject(object: ObjectLiteralExpression): ReadonlyArray<Statement> | undefined {
+    function tryChangeModuleExportsObject(object: ObjectLiteralExpression): ReadonlyArray<Statement> | undefined {
         return mapAllOrFail(object.properties, prop => {
             switch (prop.kind) {
                 case SyntaxKind.GetAccessor:
@@ -348,7 +341,7 @@ namespace ts.refactor {
         });
     }
 
-    function doModuleExports(exported: Expression): Statement {
+    function changeModuleExportsToExportDefault(exported: Expression): Statement {
         const modifiers = [createToken(SyntaxKind.ExportKeyword), createToken(SyntaxKind.DefaultKeyword)];
         switch (exported.kind) {
             case SyntaxKind.FunctionExpression:
@@ -420,7 +413,7 @@ namespace ts.refactor {
     function doSingleImport(
         file: SourceFile,
         name: BindingName,
-        moduleSpecifier: StringLiteralLike,
+        moduleSpecifier: string,
         changes: textChanges.ChangeTracker,
         checker: TypeChecker,
         identifiers: Identifiers,
@@ -466,7 +459,7 @@ namespace ts.refactor {
             createVariableDeclarationList([createVariableDeclaration(name, /*type*/ undefined, init)], NodeFlags.Const));
     }
 
-    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: StringLiteralLike, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): ReadonlyArray<Node> {
+    function doSingleIdentifierImport(file: SourceFile, name: Identifier, moduleSpecifier: string, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): ReadonlyArray<Node> {
         //At each use:
         //If it's `name.foo`: use a named binding to "foo"
         //If it's anything else (e.g. `name()`): use a default import
@@ -509,14 +502,14 @@ namespace ts.refactor {
             // If it was unused, ensure that we at least import *something*.
             needDefaultImport = true;
         }
-        return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, createLiteral(moduleSpecifier))];
+        return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, moduleSpecifier)];
     }
 
-    function nameFromModuleSpecifier(moduleSpecifier: StringLiteralLike, identifiers: Identifiers): string {
-        return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier.text), identifiers);
+    function nameFromModuleSpecifier(moduleSpecifier: string, identifiers: Identifiers): string {
+        return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier), identifiers);
     }
 
-    //will be in imports
+    //this was in the other PR
     function moduleNameToValidIdentifier(moduleSpecifier: string): string {
         if (moduleSpecifier.length === 0) {
             return "_";
@@ -594,8 +587,8 @@ namespace ts.refactor {
         }
     }
 
-    function makeImport(name: Identifier | undefined, namedImports: ReadonlyArray<ImportSpecifier>, moduleSpecifier: Expression): ImportDeclaration {
+    function makeImport(name: Identifier | undefined, namedImports: ReadonlyArray<ImportSpecifier>, moduleSpecifier: string): ImportDeclaration {
         const importClause = (name || namedImports) && createImportClause(name, namedImports && createNamedImports(namedImports));
-        return createImportDeclaration(/*decorators*/ undefined, /*modifiers*/ undefined, importClause, moduleSpecifier);
+        return createImportDeclaration(/*decorators*/ undefined, /*modifiers*/ undefined, importClause, createLiteral(moduleSpecifier));
     }
 }
