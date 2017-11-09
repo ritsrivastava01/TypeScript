@@ -120,31 +120,30 @@ namespace ts.refactor {
     /** @returns Whether we converted a `module.exports =` to a default export. */
     function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): boolean {
         const identifiers: Identifiers = { original: collectFreeIdentifiers(sourceFile), additional: createMap<true>() };
-        const exports = collectExportsAccesses(sourceFile, checker, identifiers);
+        const exports = collectExportRenames(sourceFile, checker, identifiers);
         changeExportsAccesses(sourceFile, exports, changes);
         const moduleExportsChangedToDefault = doStatements(sourceFile, checker, changes, identifiers, exports);
         return moduleExportsChangedToDefault;
     }
 
-    //Contains an entry for each renamed export.
-    type ExportRenames = ReadonlyMap<string>; //name
+    /**
+     * Contains an entry for each renamed export.
+     * This is necessary because `exports.x = 0;` does not declare a local variable.
+     * Converting this to `export const x = 0;` would declare a local, so we must be careful to avoid shadowing.
+     * If there would be shadowing at either the declaration or at any reference to `exports.x` (now just `x`), we must conver to:
+     *     const _x = 0;
+     *     export { _x as x };
+     * This conversion also must place if the exported name is not a valid identifier, e.g. `exports.class = 0;`.
+     */
+    type ExportRenames = ReadonlyMap<string>;
 
-    function collectExportsAccesses(sourceFile: SourceFile, checker: TypeChecker, identifiers: Identifiers): ExportRenames {
+    function collectExportRenames(sourceFile: SourceFile, checker: TypeChecker, identifiers: Identifiers): ExportRenames {
         const res = createMap<string>();
         forEachExportReference(sourceFile, node => {
             const { text, originalKeywordKind } = node.name;
-            if (res.has(text)) {
-                return;
-            }
-
-            if (originalKeywordKind !== undefined && isKeyword(originalKeywordKind) && !isContextualKeyword(originalKeywordKind)) {
+            if (!res.has(text) && (originalKeywordKind !== undefined && isNonContextualKeyword(originalKeywordKind)
+                || checker.resolveName(node.name.text, node, SymbolFlags.Value, /*includeGlobals*/ false))) {
                 res.set(text, makeUniqueName(`_${text}`, identifiers));
-            }
-            else {
-                if (checker.resolveName(node.name.text, node, SymbolFlags.Value, /*includeGlobals*/ false)) {
-                    // This name already exists, must rename.
-                    res.set(text, makeUniqueName(`_${text}`, identifiers)); //dup code...
-                }
             }
         });
         return res;
@@ -517,6 +516,7 @@ namespace ts.refactor {
         return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier.text), identifiers);
     }
 
+    //will be in imports
     function moduleNameToValidIdentifier(moduleSpecifier: string): string {
         if (moduleSpecifier.length === 0) {
             return "_";
@@ -559,6 +559,11 @@ namespace ts.refactor {
         return name;
     }
 
+    /**
+     * Helps us create unique identifiers.
+     * `original` refers to the local variable names in the original source file.
+     * `additional` is any new unique identifiers we've generated. (e.g., we'll generate `_x`, then `__x`.)
+     */
     interface Identifiers {
         readonly original: FreeIdentifiers;
         // Additional identifiers we've added. Mutable!

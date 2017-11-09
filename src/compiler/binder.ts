@@ -1721,7 +1721,6 @@ namespace ts {
 
         // The binder visits every node in the syntax tree so it is a convenient place to perform a single localized
         // check for reserved words used as identifiers in strict mode code.
-        //!
         function checkStrictModeIdentifier(node: Identifier) {
             if (inStrictMode &&
                 node.originalKeywordKind >= SyntaxKind.FirstFutureReservedWord &&
@@ -2590,7 +2589,6 @@ namespace ts {
     }
 
     function isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile: SourceFile, node: Identifier): boolean {
-        //lookupSymbolForName only looks in the current container. So don't bother if that's not the source file.
         const symbol = lookupSymbolForNameWorker(sourceFile, node.escapedText);
         return symbol && symbol.valueDeclaration && isVariableDeclaration(symbol.valueDeclaration) &&
             symbol.valueDeclaration.initializer && isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, symbol.valueDeclaration.initializer);
@@ -2602,8 +2600,7 @@ namespace ts {
                 isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, node.left) || isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, node.right)));
     }
 
-    //!
-    function lookupSymbolForNameWorker(container: Node, name: __String) {
+    function lookupSymbolForNameWorker(container: Node, name: __String): Symbol | undefined {
         return (container.symbol && container.symbol.exports && container.symbol.exports.get(name)) || (container.locals && container.locals.get(name));
     }
 
