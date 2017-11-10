@@ -1,6 +1,6 @@
 /// <reference path='fourslash.ts' />
 
-// TODO: maybe we could transform this to `export function f() {}`
+// TODO: Maybe we could transform this to `export function f() {}`.
 
 // @allowJs: true
 
