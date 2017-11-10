@@ -85,7 +85,7 @@ namespace ts.refactor {
         const { file, program } = context;
         Debug.assert(isSourceFileJavaScript(file));
         const edits = textChanges.ChangeTracker.with(context, changes => {
-            const moduleExportsChangedToDefault = convertFileToEs6Module(file, program.getTypeChecker(), changes);
+            const moduleExportsChangedToDefault = convertFileToEs6Module(file, program.getTypeChecker(), changes, program.getCompilerOptions().target);
             if (moduleExportsChangedToDefault) {
                 for (const importingFile of program.getSourceFiles()) {
                     fixImportOfModuleExports(importingFile, file, changes);
@@ -121,13 +121,13 @@ namespace ts.refactor {
     }
 
     /** @returns Whether we converted a `module.exports =` to a default export. */
-    function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker): ModuleExportsChanged {
+    function convertFileToEs6Module(sourceFile: SourceFile, checker: TypeChecker, changes: textChanges.ChangeTracker, target: ScriptTarget): ModuleExportsChanged {
         const identifiers: Identifiers = { original: collectFreeIdentifiers(sourceFile), additional: createMap<true>() };
         const exports = collectExportRenames(sourceFile, checker, identifiers);
         convertExportsAccesses(sourceFile, exports, changes);
         let moduleExportsChangedToDefault = false;
         for (const statement of sourceFile.statements) {
-            const moduleExportsChanged = convertStatement(sourceFile, statement, checker, changes, identifiers, exports);
+            const moduleExportsChanged = convertStatement(sourceFile, statement, checker, changes, identifiers, target, exports);
             moduleExportsChangedToDefault = moduleExportsChangedToDefault || moduleExportsChanged;
         }
         return moduleExportsChangedToDefault;
@@ -179,10 +179,10 @@ namespace ts.refactor {
     /** Whether `module.exports =` was changed to `export default` */
     type ModuleExportsChanged = boolean;
 
-    function convertStatement(sourceFile: SourceFile, statement: Statement, checker: TypeChecker, changes: textChanges.ChangeTracker, identifiers: Identifiers, exports: ExportRenames): ModuleExportsChanged {
+    function convertStatement(sourceFile: SourceFile, statement: Statement, checker: TypeChecker, changes: textChanges.ChangeTracker, identifiers: Identifiers, target: ScriptTarget, exports: ExportRenames): ModuleExportsChanged {
         switch (statement.kind) {
             case SyntaxKind.VariableStatement:
-                convertVariableStatement(sourceFile, statement as VariableStatement, changes, checker, identifiers);
+                convertVariableStatement(sourceFile, statement as VariableStatement, changes, checker, identifiers, target);
                 return false;
             case SyntaxKind.ExpressionStatement: {
                 const { expression } = statement as ExpressionStatement;
@@ -206,7 +206,7 @@ namespace ts.refactor {
         }
     }
 
-    function convertVariableStatement(sourceFile: SourceFile, statement: VariableStatement, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers): void {
+    function convertVariableStatement(sourceFile: SourceFile, statement: VariableStatement, changes: textChanges.ChangeTracker, checker: TypeChecker, identifiers: Identifiers, target: ScriptTarget): void {
         const { declarationList } = statement as VariableStatement;
         let foundImport = false;
         const newNodes = flatMap(declarationList.declarations, decl => {
@@ -218,7 +218,7 @@ namespace ts.refactor {
             }
             if (isRequireCall(initializer, /*checkArgumentIsStringLiteral*/ true)) {
                 foundImport = true;
-                return convertSingleImport(sourceFile, name, initializer.arguments[0].text, changes, checker, identifiers);
+                return convertSingleImport(sourceFile, name, initializer.arguments[0].text, changes, checker, identifiers, target);
             }
             else if (isPropertyAccessExpression(initializer) && isRequireCall(initializer.expression, /*checkArgumentIsStringLiteral*/ true)) {
                 foundImport = true;
@@ -401,6 +401,7 @@ namespace ts.refactor {
         changes: textChanges.ChangeTracker,
         checker: TypeChecker,
         identifiers: Identifiers,
+        target: ScriptTarget,
     ): ReadonlyArray<Node> {
         switch (name.kind) {
             case SyntaxKind.ObjectBindingPattern: {
@@ -418,7 +419,7 @@ namespace ts.refactor {
                 import x from "x";
                 const [a, b, c] = x;
                 */
-                const tmp = nameFromModuleSpecifier(moduleSpecifier, identifiers);
+                const tmp =  makeUniqueName(codefix.moduleSpecifierToValidIdentifier(moduleSpecifier, target), identifiers);
                 return [
                     makeImport(createIdentifier(tmp), /*namedImports*/ undefined, moduleSpecifier),
                     makeConst(/*modifiers*/ undefined, getSynthesizedDeepClone(name), createIdentifier(tmp)),
@@ -473,46 +474,7 @@ namespace ts.refactor {
         return [makeImport(needDefaultImport ? getSynthesizedDeepClone(name) : undefined, namedBindings, moduleSpecifier)];
     }
 
-    // Name helpers
-
-    function nameFromModuleSpecifier(moduleSpecifier: string, identifiers: Identifiers): string {
-        return makeUniqueName(moduleNameToValidIdentifier(moduleSpecifier), identifiers);
-    }
-
-    //this was in the other PR
-    function moduleNameToValidIdentifier(moduleSpecifier: string): string {
-        if (moduleSpecifier.length === 0) {
-            return "_";
-        }
-
-        //Convert to alphanumeric
-        let chars = "";
-        let lastWasValid = true;
-        const firstCharCode = moduleSpecifier.charCodeAt(0);
-        if (isIdentifierStart(firstCharCode, ScriptTarget.ESNext)) {
-            chars += String.fromCharCode(firstCharCode);
-        }
-        else {
-            lastWasValid = false;
-        }
-
-        for (let i = 1; i < moduleSpecifier.length; i++) {
-            const ch = moduleSpecifier.charCodeAt(i);
-            if (isIdentifierPart(ch, ScriptTarget.ESNext)) {
-                let char = String.fromCharCode(ch);
-                if (!lastWasValid) {
-                    char = char.toUpperCase();
-                }
-                chars += char;
-                lastWasValid = true;
-            }
-            else {
-                lastWasValid = false;
-            }
-        }
-
-        return chars || "_";
-    }
+    // Identifiers helpers
 
     function makeUniqueName(name: string, identifiers: Identifiers): string {
         while (identifiers.original.has(name) || identifiers.additional.has(name)) {
